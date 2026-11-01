@@ -1,0 +1,50 @@
+{
+  "correctness": {
+    "balance_matches_successful_operations": true,
+    "expected_balance_cents": 100,
+    "initial_balance_cents": 0,
+    "observed_balance_cents": 100
+  },
+  "description": "Synthetic concurrent deposits into one account; unique idempotency key per request",
+  "environment": {
+    "api_health": {
+      "database": "sqlite",
+      "mode": "local"
+    },
+    "api_health_status": 200,
+    "api_host": "127.0.0.1",
+    "logical_cpu_count": 8,
+    "platform": "Windows-11-10.0.26200-SP0",
+    "python": "3.13.0"
+  },
+  "limitations": [
+    "Synthetic workload, not real users or production traffic",
+    "Client and server placement affect latency",
+    "Balance check assumes no other actor mutated this benchmark account",
+    "Transport failures may have committed; investigate using recorded idempotency keys before interpreting mismatches"
+  ],
+  "results": {
+    "all_request_latency_ms": {
+      "p50": 244.611,
+      "p95": 2779.846
+    },
+    "completed_requests_per_second": 11.373,
+    "elapsed_seconds": 8.792601,
+    "response_categories": {
+      "success": 100
+    },
+    "successful_request_latency_ms": {
+      "p50": 244.611,
+      "p95": 2779.846
+    },
+    "successful_requests_per_second": 11.373,
+    "unsuccessful_requests": []
+  },
+  "started_at_utc": "2026-10-20T18:54:17.267727+00:00",
+  "workload": {
+    "account_id": "a8be9162-21b8-4d4e-93c6-399037830f60",
+    "amount_cents": 1,
+    "concurrency": 8,
+    "requests": 100
+  }
+}

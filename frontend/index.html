@@ -1,0 +1,128 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="theme-color" content="#122d38">
+  <meta name="description" content="Capital Ledger is a banking simulator with an auditable ledger and reliable transaction processing.">
+  <title>Capital Ledger · Banking simulator</title>
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Crect width='64' height='64' rx='16' fill='%23122d38'/%3E%3Cpath d='M43 21a16 16 0 1 0 0 22M36 24v16h12' fill='none' stroke='%23bfe7d5' stroke-width='5'/%3E%3C/svg%3E">
+  <link rel="stylesheet" href="/styles.css">
+  <script src="/config.js" defer></script>
+  <script src="/app.js" defer></script>
+</head>
+<body>
+  <a class="skip-link" href="#main">Skip to dashboard</a>
+  <div class="app-shell">
+    <aside class="sidebar" aria-label="Application navigation">
+      <a class="brand" href="/" aria-label="Capital Ledger home"><span class="brand-mark" aria-hidden="true">C<span>L</span></span><span>Capital<br><strong>Ledger</strong></span></a>
+      <div class="sidebar-caption">YOUR WORKSPACE</div>
+      <nav class="nav-list">
+        <a class="nav-link active" href="#overview"><span aria-hidden="true">◫</span> Overview</a>
+        <a class="nav-link" href="#activity"><span aria-hidden="true">↔</span> Activity</a>
+        <a class="nav-link" href="#integrity"><span aria-hidden="true">◇</span> System integrity</a>
+      </nav>
+      <div class="sidebar-bottom">
+        <span class="environment-badge"><span class="status-dot" id="environment-dot"></span><span id="environment-label">Connecting</span></span>
+        <p>A small interface.<br>A careful transaction engine.</p>
+        <span class="sidebar-note">SIMULATED FUNDS ONLY</span>
+      </div>
+    </aside>
+
+    <div class="workspace">
+      <header class="topbar">
+        <div class="breadcrumb">WORKSPACE <span>/</span> <strong>Overview</strong></div>
+        <div class="identity-controls">
+          <span class="user-avatar" id="user-avatar" aria-hidden="true">–</span>
+          <span id="user-label">Not signed in</span>
+          <label class="sr-only" for="demo-user">Demo user</label>
+          <select id="demo-user" hidden><option value="alice">Alice</option><option value="bob">Bob</option></select>
+          <button id="auth-button" class="button button-quiet button-small" type="button" hidden>Sign in</button>
+        </div>
+      </header>
+
+      <main id="main" tabindex="-1">
+        <section class="page-heading" id="overview" aria-labelledby="page-title">
+          <div><p class="eyebrow">CAPITAL LEDGER / BANKING SIMULATOR</p><h1 id="page-title">Every cent. Accounted for.</h1><p class="subtitle">Move simulated money. Follow the record behind every transaction.</p></div>
+          <button id="open-account" class="button button-dark" type="button" data-mutation-control disabled><span aria-hidden="true">＋</span> New account</button>
+        </section>
+
+        <div id="message" class="notice" role="status" aria-live="polite" hidden></div>
+        <section id="pending-notice" class="pending-notice" aria-labelledby="pending-title" hidden>
+          <div><strong id="pending-title">An operation needs a confirmed result</strong><p id="pending-description">Retry the saved request using its original key before starting another operation.</p></div>
+          <button id="retry-request" class="button button-dark button-small" type="button">Retry saved request</button>
+        </section>
+        <section id="signed-out" class="empty-state auth-empty" hidden><span class="empty-icon" aria-hidden="true">↗</span><h2>Your ledger starts here</h2><p>Sign in to create accounts and explore the transaction engine.</p><button id="welcome-signin" class="button button-dark" type="button">Sign in</button></section>
+
+        <div id="dashboard" hidden>
+          <div class="dashboard-grid">
+            <section class="account-area" aria-labelledby="accounts-heading">
+              <div class="section-heading"><h2 id="accounts-heading">Your accounts</h2><span id="account-count" class="muted">0 accounts</span></div>
+              <div id="account-tabs" class="account-tabs" role="group" aria-label="Select account"></div>
+              <div id="account-empty" class="empty-state account-empty" hidden><span class="empty-icon" aria-hidden="true">＋</span><h3>A fresh start</h3><p>Create your first account with an optional simulated opening balance.</p><button id="empty-open-account" class="button button-dark" type="button" data-mutation-control>Open an account</button></div>
+              <article id="balance-card" class="balance-card" hidden>
+                <div class="balance-card-top"><span id="account-name">Everyday account</span><span class="currency-tag">USD</span></div>
+                <p class="balance-label">Available balance</p><p class="balance-amount" id="account-balance">—</p>
+                <div class="balance-card-bottom"><div><span class="card-small-label">ACCOUNT HOLDER</span><span id="account-holder">—</span></div><div class="card-emblem" aria-hidden="true">CL<span>✳</span></div></div>
+              </article>
+              <div id="account-details" class="account-details" hidden>
+                <div class="account-id-row"><div><span class="small-label">ACCOUNT ID</span><code id="account-id">—</code></div><button id="copy-account-id" class="icon-button" type="button" aria-label="Copy account ID" title="Copy account ID">⧉</button></div>
+                <div class="projection-status"><span class="status-dot" id="projection-dot"></span><span id="projection-label">Checking balance summary</span><span id="projection-version" class="projection-version"></span></div>
+                <p id="projection-detail" class="projection-detail">The displayed balance comes from the authoritative ledger.</p>
+              </div>
+            </section>
+
+            <section class="panel actions-panel" aria-labelledby="actions-heading">
+              <div class="section-heading"><h2 id="actions-heading">Move money</h2><span class="simulation-tag">SIMULATION</span></div>
+              <div class="action-tabs" role="group" aria-label="Choose operation"><button class="action-tab active" type="button" data-action="deposit" aria-pressed="true">Deposit</button><button class="action-tab" type="button" data-action="withdrawal" aria-pressed="false">Withdraw</button><button class="action-tab" type="button" data-action="transfer" aria-pressed="false">Transfer</button></div>
+              <form id="money-form" novalidate>
+                <fieldset id="money-fields" disabled>
+                  <div id="destination-field" class="form-field" hidden><label for="destination">Recipient account ID</label><input id="destination" name="destination" type="text" placeholder="Paste a recipient account ID" autocomplete="off" spellcheck="false"><p class="field-hint">Use the account ID shared by the recipient.</p></div>
+                  <div class="form-field"><label for="amount">Amount</label><div class="amount-input"><span aria-hidden="true">$</span><input id="amount" name="amount" type="text" inputmode="decimal" placeholder="0.00" autocomplete="off" aria-describedby="amount-hint" required><span class="input-currency">USD</span></div><p id="amount-hint" class="field-hint">Use up to two decimal places.</p></div>
+                  <div class="form-field"><label for="description">Description <span class="optional">optional</span></label><input id="description" name="description" type="text" maxlength="160" placeholder="What is this for?" autocomplete="off"></div>
+                  <button id="money-submit" class="button button-teal button-full" type="submit">Add simulated funds <span aria-hidden="true">↗</span></button>
+                </fieldset>
+                <p id="money-note" class="form-note">Deposits create simulated funds. No bank or payment network is connected.</p>
+              </form>
+            </section>
+          </div>
+
+          <section id="activity" class="panel activity-panel" aria-labelledby="activity-heading">
+            <div class="section-heading"><div><p class="eyebrow">THE AUDIT TRAIL</p><h2 id="activity-heading">Recent activity</h2></div><button id="refresh" class="button button-quiet button-small" type="button"><span aria-hidden="true">↻</span> Refresh</button></div>
+            <div class="table-scroll"><table><thead><tr><th scope="col">Transaction</th><th scope="col">Date &amp; time</th><th scope="col">Reference</th><th scope="col" class="align-right">Amount</th></tr></thead><tbody id="transactions"></tbody></table></div>
+            <div id="transactions-empty" class="table-empty" hidden>No transactions yet. Your account activity will appear here.</div>
+            <p class="table-caption">Completed ledger entries for the selected account. All amounts are in USD.</p>
+          </section>
+
+          <section id="integrity" class="integrity-section" aria-labelledby="integrity-heading">
+            <div class="section-heading"><div><p class="eyebrow">BEHIND THE BALANCE</p><h2 id="integrity-heading">System integrity</h2></div><span id="integrity-badge" class="integrity-badge">Waiting for check</span></div>
+            <div class="integrity-grid">
+              <article class="panel integrity-stat"><span class="stat-icon" aria-hidden="true">≡</span><span class="small-label">LEDGER RECONCILIATION</span><strong id="reconciliation-result">—</strong><p id="reconciliation-detail">Checking account balances against their ledger entries.</p></article>
+              <article class="panel integrity-stat"><span class="stat-icon" aria-hidden="true">⇄</span><span class="small-label">SUMMARY SYNC</span><strong id="pending-count">—</strong><p id="outbox-detail">Committed events update the account summary reliably.</p></article>
+              <article class="panel integrity-stat"><span class="stat-icon" aria-hidden="true">◇</span><span class="small-label">REQUEST SAFETY</span><strong>Safe to retry</strong><p>Money requests reuse a saved idempotency key until their outcome is confirmed.</p></article>
+            </div>
+            <div id="local-controls" class="local-controls" hidden><div><strong>Explore recovery</strong><p>Pause summary sync, make a transaction, then resume to watch the summary catch up.</p></div><div class="worker-buttons"><button id="toggle-worker" class="button button-outline button-small" type="button" aria-pressed="false">Pause summary sync</button><button id="sync-now" class="button button-quiet button-small" type="button">Sync now <span aria-hidden="true">↗</span></button></div></div>
+            <details id="mismatch-details" class="mismatch-details" hidden><summary>View reconciliation findings</summary><pre id="mismatch-json"></pre></details>
+          </section>
+        </div>
+        <footer><span>Capital Ledger <span class="footer-separator">/</span> Banking simulator</span><span>Built around correctness. Simulated money only.</span></footer>
+      </main>
+    </div>
+  </div>
+
+  <dialog id="account-dialog" aria-labelledby="create-account-title">
+    <div class="dialog-heading"><div><p class="eyebrow">A NEW BEGINNING</p><h2 id="create-account-title">Open an account</h2></div><button id="close-account-dialog" class="icon-button" type="button" aria-label="Close account form">×</button></div>
+    <p class="dialog-intro">Create an account in the simulator. Use fictional personal details.</p>
+    <form id="account-form" novalidate>
+      <fieldset id="account-fields">
+        <div class="form-field"><label for="full-name">Full name</label><input id="full-name" name="full_name" type="text" maxlength="100" autocomplete="off" placeholder="Alice Morgan" required></div>
+        <div class="form-field"><label for="date-of-birth">Date of birth</label><input id="date-of-birth" name="date_of_birth" type="date" autocomplete="off" required></div>
+        <div class="form-field"><label for="new-account-name">Account name</label><input id="new-account-name" name="name" type="text" maxlength="60" value="Everyday account" autocomplete="off" required></div>
+        <div class="form-field"><label for="opening-balance">Simulated opening balance</label><div class="amount-input"><span aria-hidden="true">$</span><input id="opening-balance" name="initial_balance" type="text" inputmode="decimal" value="0.00" autocomplete="off" required><span class="input-currency">USD</span></div><p class="field-hint">Optional funding is recorded in the ledger. Zero is allowed.</p></div>
+        <p id="account-form-error" class="form-error" role="alert" hidden></p>
+        <button class="button button-teal button-full" type="submit">Create account <span aria-hidden="true">↗</span></button>
+      </fieldset>
+    </form>
+  </dialog>
+</body>
+</html>

@@ -1,0 +1,604 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: Capital Ledger - simulated banking backend with Aurora ledger and DynamoDB summaries.
+
+Parameters:
+  AuroraEngineVersion:
+    Type: String
+    Description: Supported Aurora PostgreSQL 16.x engine version; deploy.ps1 resolves an available version.
+    AllowedPattern: '^16\.[0-9]+(\.[0-9]+)?$'
+  CognitoDomainPrefix:
+    Type: String
+    Description: Unique Cognito hosted-login domain prefix in this AWS Region.
+    AllowedPattern: '^[a-z0-9][a-z0-9-]{0,61}[a-z0-9]$'
+  ExistingLambdaRoleArn:
+    Type: String
+    Default: ''
+    Description: Optional pre-approved lab execution role. Its policies must already allow the documented resource access.
+    AllowedPattern: '^$|^arn:[a-z-]+:iam::[0-9]{12}:role/.+$'
+  EnableSchedules:
+    Type: String
+    Default: 'true'
+    AllowedValues: ['true', 'false']
+    Description: Run outbox every minute and reconciliation every five minutes after bootstrap.
+
+Conditions:
+  CreateExecutionRoles: !Equals [!Ref ExistingLambdaRoleArn, '']
+  SchedulesEnabled: !Equals [!Ref EnableSchedules, 'true']
+
+Globals:
+  Function:
+    Runtime: python3.12
+    Architectures: [arm64]
+    Timeout: 28
+    MemorySize: 256
+    Environment:
+      Variables:
+        DB_BACKEND: aurora
+        AURORA_CLUSTER_ARN: !GetAtt LedgerCluster.DBClusterArn
+        AURORA_SECRET_ARN: !GetAtt LedgerCluster.MasterUserSecret.SecretArn
+        AURORA_DATABASE: ledger
+        ACCOUNTS_TABLE: !Ref CustomerAccounts
+        AUTH_MODE: cognito
+        ALLOWED_ORIGIN: !Sub 'https://${FrontendDistribution.DomainName}'
+        LOG_LEVEL: INFO
+
+Resources:
+  LedgerVpc:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: 10.43.0.0/16
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-ledger'
+
+  PrivateSubnetA:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref LedgerVpc
+      CidrBlock: 10.43.0.0/24
+      AvailabilityZone: !Select [0, !GetAZs '']
+      MapPublicIpOnLaunch: false
+
+  PrivateSubnetB:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref LedgerVpc
+      CidrBlock: 10.43.1.0/24
+      AvailabilityZone: !Select [1, !GetAZs '']
+      MapPublicIpOnLaunch: false
+
+  LedgerDbSubnetGroup:
+    Type: AWS::RDS::DBSubnetGroup
+    Properties:
+      DBSubnetGroupDescription: Private subnets for the simulated ledger.
+      SubnetIds: [!Ref PrivateSubnetA, !Ref PrivateSubnetB]
+
+  LedgerDbSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: No SQL ingress; Lambda uses the authenticated RDS Data API.
+      VpcId: !Ref LedgerVpc
+      SecurityGroupIngress: []
+      SecurityGroupEgress:
+        - IpProtocol: '-1'
+          CidrIp: 127.0.0.1/32
+          Description: No external egress is needed.
+
+  LedgerCluster:
+    Type: AWS::RDS::DBCluster
+    DeletionPolicy: Snapshot
+    UpdateReplacePolicy: Snapshot
+    Properties:
+      Engine: aurora-postgresql
+      EngineVersion: !Ref AuroraEngineVersion
+      EngineMode: provisioned
+      DatabaseName: ledger
+      MasterUsername: ledgeradmin
+      ManageMasterUserPassword: true
+      EnableHttpEndpoint: true
+      StorageEncrypted: true
+      BackupRetentionPeriod: 1
+      CopyTagsToSnapshot: true
+      DBSubnetGroupName: !Ref LedgerDbSubnetGroup
+      VpcSecurityGroupIds: [!Ref LedgerDbSecurityGroup]
+      ServerlessV2ScalingConfiguration:
+        MinCapacity: 0.5
+        MaxCapacity: 2
+      EnableCloudwatchLogsExports: [postgresql]
+
+  LedgerWriter:
+    Type: AWS::RDS::DBInstance
+    Properties:
+      DBClusterIdentifier: !Ref LedgerCluster
+      Engine: aurora-postgresql
+      DBInstanceClass: db.serverless
+      PubliclyAccessible: false
+      AutoMinorVersionUpgrade: true
+
+  CustomerAccounts:
+    Type: AWS::DynamoDB::Table
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: account_id
+          AttributeType: S
+        - AttributeName: owner_id
+          AttributeType: S
+        - AttributeName: created_at
+          AttributeType: S
+      KeySchema:
+        - AttributeName: account_id
+          KeyType: HASH
+      GlobalSecondaryIndexes:
+        - IndexName: owner_id-index
+          KeySchema:
+            - AttributeName: owner_id
+              KeyType: HASH
+            - AttributeName: created_at
+              KeyType: RANGE
+          Projection:
+            ProjectionType: ALL
+      SSESpecification:
+        SSEEnabled: true
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+
+  FrontendBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      WebsiteConfiguration:
+        IndexDocument: index.html
+        ErrorDocument: index.html
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      OwnershipControls:
+        Rules:
+          - ObjectOwnership: BucketOwnerEnforced
+
+  FrontendOriginAccessControl:
+    Type: AWS::CloudFront::OriginAccessControl
+    Properties:
+      OriginAccessControlConfig:
+        Name: !Sub '${AWS::StackName}-frontend'
+        Description: Signed CloudFront reads from private S3 frontend.
+        OriginAccessControlOriginType: s3
+        SigningBehavior: always
+        SigningProtocol: sigv4
+
+  FrontendDistribution:
+    Type: AWS::CloudFront::Distribution
+    Properties:
+      DistributionConfig:
+        Enabled: true
+        Comment: !Sub '${AWS::StackName} S3 frontend'
+        DefaultRootObject: index.html
+        HttpVersion: http2
+        PriceClass: PriceClass_100
+        Origins:
+          - Id: frontend-s3
+            DomainName: !GetAtt FrontendBucket.RegionalDomainName
+            OriginAccessControlId: !GetAtt FrontendOriginAccessControl.Id
+            S3OriginConfig:
+              OriginAccessIdentity: ''
+        DefaultCacheBehavior:
+          TargetOriginId: frontend-s3
+          ViewerProtocolPolicy: redirect-to-https
+          AllowedMethods: [GET, HEAD, OPTIONS]
+          CachedMethods: [GET, HEAD, OPTIONS]
+          Compress: true
+          # AWS managed CachingDisabled: config changes must reach the SPA immediately.
+          CachePolicyId: 413f160f-195e-4e8d-a15f-70a343da33b0
+        ViewerCertificate:
+          CloudFrontDefaultCertificate: true
+
+  FrontendBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref FrontendBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: CloudFrontReadOnly
+            Effect: Allow
+            Principal:
+              Service: cloudfront.amazonaws.com
+            Action: s3:GetObject
+            Resource: !Sub '${FrontendBucket.Arn}/*'
+            Condition:
+              StringEquals:
+                AWS:SourceArn: !Sub 'arn:${AWS::Partition}:cloudfront::${AWS::AccountId}:distribution/${FrontendDistribution}'
+          - Sid: RequireTls
+            Effect: Deny
+            Principal: '*'
+            Action: 's3:*'
+            Resource: [!GetAtt FrontendBucket.Arn, !Sub '${FrontendBucket.Arn}/*']
+            Condition:
+              Bool:
+                aws:SecureTransport: false
+
+  UserPool:
+    Type: AWS::Cognito::UserPool
+    Properties:
+      UserPoolName: !Sub '${AWS::StackName}-users'
+      UsernameAttributes: [email]
+      AutoVerifiedAttributes: [email]
+      UserAttributeUpdateSettings:
+        AttributesRequireVerificationBeforeUpdate: [email]
+      Policies:
+        PasswordPolicy:
+          MinimumLength: 12
+          RequireLowercase: true
+          RequireUppercase: true
+          RequireNumbers: true
+          RequireSymbols: false
+          TemporaryPasswordValidityDays: 1
+      AccountRecoverySetting:
+        RecoveryMechanisms:
+          - Name: verified_email
+            Priority: 1
+
+  UserPoolResourceServer:
+    Type: AWS::Cognito::UserPoolResourceServer
+    Properties:
+      UserPoolId: !Ref UserPool
+      Identifier: ledger-api
+      Name: Capital Ledger API
+      Scopes:
+        - ScopeName: access
+          ScopeDescription: Access owned simulated accounts and transactions.
+
+  UserPoolClient:
+    Type: AWS::Cognito::UserPoolClient
+    DependsOn: UserPoolResourceServer
+    Properties:
+      UserPoolId: !Ref UserPool
+      ClientName: capital-ledger-web
+      GenerateSecret: false
+      PreventUserExistenceErrors: ENABLED
+      EnableTokenRevocation: true
+      AllowedOAuthFlowsUserPoolClient: true
+      AllowedOAuthFlows: [code]
+      AllowedOAuthScopes: [openid, email, profile, ledger-api/access]
+      SupportedIdentityProviders: [COGNITO]
+      CallbackURLs: [!Sub 'https://${FrontendDistribution.DomainName}/']
+      LogoutURLs: [!Sub 'https://${FrontendDistribution.DomainName}/']
+      AccessTokenValidity: 15
+      IdTokenValidity: 15
+      RefreshTokenValidity: 1
+      TokenValidityUnits:
+        AccessToken: minutes
+        IdToken: minutes
+        RefreshToken: days
+
+  UserPoolDomain:
+    Type: AWS::Cognito::UserPoolDomain
+    Properties:
+      Domain: !Ref CognitoDomainPrefix
+      UserPoolId: !Ref UserPool
+
+  HttpApi:
+    Type: AWS::Serverless::HttpApi
+    Properties:
+      StageName: '$default'
+      CorsConfiguration:
+        AllowOrigins: [!Sub 'https://${FrontendDistribution.DomainName}']
+        AllowMethods: [GET, POST, OPTIONS]
+        AllowHeaders: [Authorization, Content-Type, Idempotency-Key]
+        MaxAge: 300
+      Auth:
+        DefaultAuthorizer: CognitoJwt
+        Authorizers:
+          CognitoJwt:
+            IdentitySource: '$request.header.Authorization'
+            AuthorizationScopes: [ledger-api/access]
+            JwtConfiguration:
+              issuer: !Sub 'https://cognito-idp.${AWS::Region}.amazonaws.com/${UserPool}'
+              audience: [!Ref UserPoolClient]
+
+  ApiExecutionRole:
+    Type: AWS::IAM::Role
+    Condition: CreateExecutionRoles
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: ledger-api-resources
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: [rds-data:ExecuteStatement, rds-data:BatchExecuteStatement, rds-data:BeginTransaction, rds-data:CommitTransaction, rds-data:RollbackTransaction]
+                Resource: !GetAtt LedgerCluster.DBClusterArn
+              - Effect: Allow
+                Action: secretsmanager:GetSecretValue
+                Resource: !GetAtt LedgerCluster.MasterUserSecret.SecretArn
+              - Effect: Allow
+                Action: [dynamodb:GetItem, dynamodb:PutItem, dynamodb:UpdateItem, dynamodb:Query, dynamodb:Scan]
+                Resource: [!GetAtt CustomerAccounts.Arn, !Sub '${CustomerAccounts.Arn}/index/*']
+              - Effect: Allow
+                Action: [logs:CreateLogStream, logs:PutLogEvents]
+                Resource:
+                  - !Sub 'arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/${AWS::StackName}-accounts:*'
+                  - !Sub 'arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/${AWS::StackName}-transactions:*'
+
+  WorkerExecutionRole:
+    Type: AWS::IAM::Role
+    Condition: CreateExecutionRoles
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: ledger-worker-resources
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: [rds-data:ExecuteStatement, rds-data:BeginTransaction, rds-data:CommitTransaction, rds-data:RollbackTransaction]
+                Resource: !GetAtt LedgerCluster.DBClusterArn
+              - Effect: Allow
+                Action: secretsmanager:GetSecretValue
+                Resource: !GetAtt LedgerCluster.MasterUserSecret.SecretArn
+              - Effect: Allow
+                Action: [dynamodb:GetItem, dynamodb:PutItem, dynamodb:UpdateItem]
+                Resource: !GetAtt CustomerAccounts.Arn
+              - Effect: Allow
+                Action: [logs:CreateLogStream, logs:PutLogEvents]
+                Resource: !Sub 'arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/${AWS::StackName}-outbox:*'
+
+  ReconcileExecutionRole:
+    Type: AWS::IAM::Role
+    Condition: CreateExecutionRoles
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: ledger-reconcile-resources
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: [rds-data:ExecuteStatement, rds-data:BeginTransaction, rds-data:CommitTransaction, rds-data:RollbackTransaction]
+                Resource: !GetAtt LedgerCluster.DBClusterArn
+              - Effect: Allow
+                Action: secretsmanager:GetSecretValue
+                Resource: !GetAtt LedgerCluster.MasterUserSecret.SecretArn
+              - Effect: Allow
+                Action: [dynamodb:GetItem, dynamodb:Scan, dynamodb:Query]
+                Resource: [!GetAtt CustomerAccounts.Arn, !Sub '${CustomerAccounts.Arn}/index/*']
+              - Effect: Allow
+                Action: [logs:CreateLogStream, logs:PutLogEvents]
+                Resource: !Sub 'arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/${AWS::StackName}-reconcile:*'
+
+  BootstrapExecutionRole:
+    Type: AWS::IAM::Role
+    Condition: CreateExecutionRoles
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: ledger-bootstrap-resources
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: [rds-data:ExecuteStatement, rds-data:BeginTransaction, rds-data:CommitTransaction, rds-data:RollbackTransaction]
+                Resource: !GetAtt LedgerCluster.DBClusterArn
+              - Effect: Allow
+                Action: secretsmanager:GetSecretValue
+                Resource: !GetAtt LedgerCluster.MasterUserSecret.SecretArn
+              - Effect: Allow
+                Action: [logs:CreateLogStream, logs:PutLogEvents]
+                Resource: !Sub 'arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/${AWS::StackName}-bootstrap:*'
+
+  AccountsFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: ../backend/
+      FunctionName: !Sub '${AWS::StackName}-accounts'
+      Handler: ledger.handlers.accounts_handler
+      Role: !If [CreateExecutionRoles, !GetAtt ApiExecutionRole.Arn, !Ref ExistingLambdaRoleArn]
+      Events:
+        Health:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref HttpApi
+            Path: /api/health
+            Method: GET
+            Auth:
+              Authorizer: NONE
+        Me:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref HttpApi
+            Path: /api/me
+            Method: GET
+        ListAccounts:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref HttpApi
+            Path: /api/accounts
+            Method: GET
+        CreateAccount:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref HttpApi
+            Path: /api/accounts
+            Method: POST
+        GetAccount:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref HttpApi
+            Path: /api/accounts/{id}
+            Method: GET
+
+  TransactionsFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: ../backend/
+      FunctionName: !Sub '${AWS::StackName}-transactions'
+      Handler: ledger.handlers.transactions_handler
+      Role: !If [CreateExecutionRoles, !GetAtt ApiExecutionRole.Arn, !Ref ExistingLambdaRoleArn]
+      Events:
+        ListTransactions:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref HttpApi
+            Path: /api/transactions
+            Method: GET
+        Deposit:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref HttpApi
+            Path: /api/accounts/{id}/deposits
+            Method: POST
+        Withdrawal:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref HttpApi
+            Path: /api/accounts/{id}/withdrawals
+            Method: POST
+        Transfer:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref HttpApi
+            Path: /api/transfers
+            Method: POST
+
+  OutboxFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: ../backend/
+      FunctionName: !Sub '${AWS::StackName}-outbox'
+      Handler: ledger.handlers.worker_handler
+      Timeout: 60
+      ReservedConcurrentExecutions: 1
+      Role: !If [CreateExecutionRoles, !GetAtt WorkerExecutionRole.Arn, !Ref ExistingLambdaRoleArn]
+      Events:
+        Poll:
+          Type: Schedule
+          Properties:
+            Schedule: rate(1 minute)
+            State: !If [SchedulesEnabled, ENABLED, DISABLED]
+            RetryPolicy:
+              MaximumRetryAttempts: 2
+
+  ReconcileFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: ../backend/
+      FunctionName: !Sub '${AWS::StackName}-reconcile'
+      Handler: ledger.handlers.reconcile_handler
+      Timeout: 60
+      ReservedConcurrentExecutions: 1
+      Role: !If [CreateExecutionRoles, !GetAtt ReconcileExecutionRole.Arn, !Ref ExistingLambdaRoleArn]
+      Events:
+        Check:
+          Type: Schedule
+          Properties:
+            Schedule: rate(5 minutes)
+            State: !If [SchedulesEnabled, ENABLED, DISABLED]
+            RetryPolicy:
+              MaximumRetryAttempts: 2
+
+  BootstrapFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: ../backend/
+      FunctionName: !Sub '${AWS::StackName}-bootstrap'
+      Handler: ledger.handlers.bootstrap_handler
+      Timeout: 120
+      ReservedConcurrentExecutions: 1
+      Role: !If [CreateExecutionRoles, !GetAtt BootstrapExecutionRole.Arn, !Ref ExistingLambdaRoleArn]
+
+  AccountsLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${AWS::StackName}-accounts'
+      RetentionInDays: 14
+
+  TransactionsLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${AWS::StackName}-transactions'
+      RetentionInDays: 14
+
+  OutboxLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${AWS::StackName}-outbox'
+      RetentionInDays: 14
+
+  ReconcileLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${AWS::StackName}-reconcile'
+      RetentionInDays: 14
+
+  BootstrapLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${AWS::StackName}-bootstrap'
+      RetentionInDays: 14
+
+Outputs:
+  WebsiteUrl:
+    Value: !Sub 'https://${FrontendDistribution.DomainName}'
+  FrontendBucketName:
+    Value: !Ref FrontendBucket
+  CloudFrontDistributionId:
+    Value: !Ref FrontendDistribution
+  ApiBaseUrl:
+    Value: !Sub 'https://${HttpApi}.execute-api.${AWS::Region}.${AWS::URLSuffix}'
+  CognitoDomain:
+    Value: !Sub 'https://${CognitoDomainPrefix}.auth.${AWS::Region}.amazoncognito.com'
+  CognitoClientId:
+    Value: !Ref UserPoolClient
+  CognitoUserPoolId:
+    Value: !Ref UserPool
+  AccountsTableName:
+    Value: !Ref CustomerAccounts
+  AuroraClusterArn:
+    Value: !GetAtt LedgerCluster.DBClusterArn
+  AuroraSecretArn:
+    Description: ARN only, not the password. Lambda retrieves it with its scoped execution role.
+    Value: !GetAtt LedgerCluster.MasterUserSecret.SecretArn
+  BootstrapFunctionName:
+    Value: !Ref BootstrapFunction
+  OutboxFunctionName:
+    Value: !Ref OutboxFunction
+  ReconcileFunctionName:
+    Value: !Ref ReconcileFunction
