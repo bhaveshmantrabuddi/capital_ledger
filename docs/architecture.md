@@ -17,12 +17,17 @@ flowchart LR
     C --> DELIVERY[Outbox delivery]
     T --> DELIVERY
     DELIVERY --> DDB
-    TIMER[Optional scheduled retry] --> W[Private worker Lambda]
+    C --> Q[SQS recovery signals]
+    T --> Q
+    TIMER[Configurable daily backstop] --> Q
+    Q --> W[Private maintenance Lambda]
+    W -->|Full batch continuation| Q
+    Q -->|Repeated failure| DLQ[Dead-letter queue]
     W --> SQL
     W --> DDB
 ```
 
-The demonstrated AWS deployment uses Aurora Express with the IAM PostgreSQL connector and two HTTP Lambdas. Scheduled workers and reconciliation are supported operational options, not deployed schedules in this setup.
+The October 31 demonstration originally used Aurora Express with the IAM PostgreSQL connector and two HTTP Lambdas. The recovery extension in `infra/operations.yaml` adds the private SQS-driven maintenance path shown above to an existing deployment. `infra/express.yaml` includes that support stack when provisioning a new application against an existing Express database. Deployment status and live evidence are recorded separately in [validation](validation.md); the complete new Express stack has been validated but has not been deployed from scratch.
 
 The repository also supports a local HTTP server, development identities, and an on-disk development database. Local mode is for running the same financial behavior without an AWS account. It does not simulate IAM, Cognito, Lambda invocation, or AWS network behavior. PostgreSQL tests are necessary to exercise PostgreSQL transaction semantics; SQLite tests alone are insufficient evidence for Aurora concurrency behavior.
 
@@ -44,8 +49,11 @@ Use integer cents for the supported currency. Reject booleans, fractions, zero o
 3. Lock affected account rows in stable account-ID order. Recheck ownership and available funds inside the transaction.
 4. Insert the financial transaction and ledger entries, update balances and versions, save the successful response, and create outbox events.
 5. Commit once. An exception before commit rolls everything back.
-6. Attempt to deliver only the newest pending snapshot for the returned account. This bounds work on the request path. A configured private worker drains older events and, after a transfer, delivers the recipient's snapshot. The local server runs this worker automatically; the demonstrated two-Lambda AWS deployment requires explicit replay or a separately configured worker. If delivery fails, keep the committed financial result and pending event for retry.
-7. Return the financial result and synchronization state. The UI can show a committed authoritative balance while explicitly indicating that the DynamoDB summary is still catching up.
+6. Attempt to deliver only the newest pending snapshot for the returned account. This bounds work on the request path. If delivery fails, keep the committed financial result and pending event for retry.
+7. If a recovery queue is configured, send a generic wake-up signal after a successful mutation. The signal contains no customer data and is not the authoritative event record. A notification failure or a near-deadline deferral does not turn an already committed result into a failed financial request. The configured daily signal provides a backstop for a lost notification.
+8. Return the financial result and synchronization state. The UI can show a committed authoritative balance while explicitly indicating that the DynamoDB summary is still catching up.
+
+The private maintenance handler drains at most 100 durable SQL outbox events, then reconciles the ledger and snapshots. It sends one continuation signal only after a full, successful batch; an empty or partial batch ends the chain. This also delivers the recipient snapshot after a transfer. A delivery failure or financial discrepancy fails the SQS invocation for retry and eventual dead-letter handling. The local HTTP server runs its own background worker instead of this AWS queue.
 
 Database uniqueness on the idempotency scope/key protects simultaneous retries. A matching repeat returns its saved result. Reusing a key for different request details returns a conflict. The database transaction, rather than an application memory cache, protects this behavior across restarts.
 
@@ -61,12 +69,14 @@ PostgreSQL and Aurora transactions set a two-second lock timeout and an eight-se
 | Process ends before SQL commit | Database rollback; no partial balance or ledger change. |
 | Response is lost after commit | Retrying with the original key returns the saved result. |
 | DynamoDB unavailable after commit | Financial result remains committed; outbox retains work for retry. |
+| Immediate recovery notification fails or is deferred | SQL outbox remains durable; a later mutation, the enabled daily backstop, or an operator's independent signal can restart delivery. |
 | Worker ends after writing DynamoDB but before marking delivery | Event may run again; the version check makes redelivery harmless. |
+| Maintenance repeatedly fails | SQS retries the failed batch, then sends it to the source queue's dead-letter queue for investigation. |
 | Events arrive out of order | A lower or equal account version cannot replace a newer snapshot. |
 | Competing withdrawals | Database transaction and account locking/conditional checks prevent spending the same available balance twice. |
 | Competing transfers | Stable account lock order reduces deadlocks; each transfer commits both account movements together. |
 
-An outbox provides at-least-once delivery attempts. It does not promise one delivery attempt or immediate cross-store consistency. A stopped worker means summary lag until recovery. Spending checks always read the SQL authority so stale DynamoDB balances cannot authorize a withdrawal.
+An outbox provides at-least-once delivery attempts. It does not promise one delivery attempt or immediate cross-store consistency. A stopped worker means summary lag until recovery. Spending checks always read the SQL authority so stale DynamoDB balances cannot authorize a withdrawal. Default AWS recursive-loop protection stays enabled; an unusually long continuation chain can require an independent signal or dead-letter review. See [recovery configuration](deployment.md#outbox-processing) for the bounds and operational limits.
 
 ## Authentication and permissions
 
@@ -76,7 +86,7 @@ Local-only development login, worker controls, and reconciliation inspection are
 
 ## Reconciliation and observability
 
-Reconciliation recomputes each account balance from ledger entries and compares it with the stored SQL balance and latest available snapshot. Missing or older snapshots are reported as synchronization lag. A same-version balance mismatch or a snapshot version ahead of the authoritative SQL version is a discrepancy. Financial records are not silently rewritten to conceal an inconsistency.
+Reconciliation recomputes each account balance from ledger entries and compares it with the stored SQL balance and latest available snapshot. Missing or older snapshots are reported as synchronization lag. A same-version balance mismatch or a snapshot version ahead of the authoritative SQL version is a discrepancy. Financial records are not silently rewritten to conceal an inconsistency. The maintenance handler emits count-only structured summaries of deliveries, mismatches, lag, and pending events; it does not log account IDs, balances, or profiles.
 
 Useful operational signals include request failures, transaction latency, pending outbox count, oldest pending event age, and reconciliation discrepancies. Avoid logging full fictional profile payloads; never add real dates of birth or other private information to test fixtures.
 
@@ -84,4 +94,4 @@ Useful operational signals include request failures, transaction latency, pendin
 
 Run the documented local test suite and benchmark to produce evidence for a specific revision. Benchmarks report their database backend, workload, concurrency, timestamps, environment, response classifications, and latency percentiles. They are synthetic workload results, not real customers or production traffic.
 
-The Express AWS deployment and customer workflow were verified on October 31, 2026; see [validation](validation.md). The separate SAM template is an optional full-configuration path, not the provisioner used for that deployment. Revalidate account permissions, connectivity, synchronization and logs when deploying your own instance.
+The Express AWS deployment and customer workflow were verified on October 31, 2026; see [validation](validation.md). The older `infra/template.yaml` remains a separate full-configuration Aurora/Data API path and did not provision that deployment. The newer `infra/express.yaml` and `scripts/deploy-express.py` automate a new application stack using an externally provisioned Express cluster. Template/package validation is not evidence of a complete fresh deployment. Revalidate account permissions, connectivity, synchronization and logs when deploying your own instance.

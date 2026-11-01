@@ -1,0 +1,11 @@
+{
+  "recorded_at_utc": "2026-11-01T21:30:07.893117+00:00",
+  "suite": "test_engine.PostgreSQLEngineTests",
+  "database": "isolated local PostgreSQL 18.1; generated schema per test",
+  "tests_run": 14,
+  "failures": 0,
+  "errors": 0,
+  "skipped": 0,
+  "duration_seconds": 47.92,
+  "successful": true
+}

@@ -2,7 +2,7 @@
 
 A banking simulator with an append-only ledger, safe request retries, and versioned customer summaries. Built as an AI-assisted learning project by Bhavesh Mantrabuddi for CMSC 398P.
 
-**Validation:** The latest local run passed 45 tests, with 14 optional PostgreSQL tests skipped because no dedicated test database was configured. The deployed AWS application was exercised through Cognito sign-in, account creation, deposits, withdrawals, persistence, and overdraft rejection; read-only Aurora and DynamoDB queries confirmed the final balance. See the [validation record](docs/validation.md) for evidence and limits.
+**Validation:** Automated checks cover financial invariants on SQLite and real PostgreSQL, HTTP behavior, AWS boundaries, recovery, and deployment guards. A reproducible Windows PostgreSQL 18.1 benchmark completed 200 deposits with 8 workers at 15.72 responses/s with p95 latency of 688.992 ms; 32 simultaneous retries committed exactly one transaction. These are local engine measurements. See the [validation record](docs/validation.md) and [PostgreSQL benchmark](docs/benchmark-postgres.md) for evidence and limits.
 
 [Hosted demo](https://d1kg2jlznlaa11.cloudfront.net/) · [Local quickstart](START-HERE.md) · [Architecture](docs/architecture.md)
 
@@ -16,7 +16,8 @@ The hosted demo uses Cognito sign-in. All accounts and funds are simulated; use 
 - Commit balances, double-entry ledger records, retry results, and outbox events together.
 - Reuse idempotency keys after uncertain responses so retries cannot move money twice.
 - Synchronize versioned customer snapshots without letting stale events overwrite newer balances.
-- Demonstrate delayed delivery, recovery, and reconciliation in local mode.
+- Recover delayed snapshots through a SQL outbox, private SQS-triggered worker, and daily reconciliation backstop on AWS.
+- Reproduce PostgreSQL contention tests and review an Express-compatible infrastructure plan before deploying.
 
 ## Components and responsibilities
 
@@ -27,8 +28,9 @@ The hosted demo uses Cognito sign-in. All accounts and funds are simulated; use 
 | Authoritative database | SQLite locally; Aurora PostgreSQL on AWS | Atomic balances, immutable ledger entries, transaction history, outbox |
 | Customer summaries | Local SQL projection; DynamoDB on AWS | Customer profiles, versioned balance snapshots |
 | Cloud entry points | Two Python Lambda functions | Separate customer and transaction routes |
+| Recovery and reconciliation | SQS, private Lambda, EventBridge, DLQ | Bounded outbox replay, daily backstop, count-only reconciliation logs |
 | Hosting and identity | S3, CloudFront, API Gateway, Cognito, IAM | HTTPS delivery, verified user tokens, scoped AWS service access |
-| Infrastructure reference | CloudFormation/SAM and PowerShell | Alternate full-configuration deployment, separate from the Express demo |
+| Deployment automation | CloudFormation and Python | New application stack referencing an existing IAM-enabled Aurora Express cluster |
 
 ```mermaid
 flowchart LR
@@ -42,6 +44,13 @@ flowchart LR
   T --> SQL
   C --> DDB[(DynamoDB snapshots)]
   T --> DDB
+  C --> Q[SQS wake-up signals]
+  T --> Q
+  E[Daily EventBridge backstop] --> Q
+  Q --> W[Private maintenance Lambda]
+  W --> SQL
+  W --> DDB
+  Q --> DLQ[Dead-letter queue after retries]
 ```
 
 Aurora is the authority for financial decisions. SQL changes commit before the DynamoDB snapshot is delivered, so cross-store consistency is eventual. The local server uses the same engine with SQLite and a background delivery worker.
@@ -72,7 +81,9 @@ The hosted version uses Aurora Express with IAM PostgreSQL authentication, two A
 
 The tracked `frontend/config.js` uses local defaults. For an AWS deployment, start from [config.aws.example.js](frontend/config.aws.example.js), supply your own public API and Cognito values, and use that configuration for the hosted assets. Browser configuration never contains AWS credentials or a client secret.
 
-See [Express setup](docs/express-setup.md) and [deployment options](docs/deployment.md). The included full-configuration template uses a different Aurora connection path and is not a one-command recreation of the Express demo. Its deployment script stops on an AWS Free plan before provisioning resources.
+See [Express setup](docs/express-setup.md) and [deployment options](docs/deployment.md). `scripts/deploy-express.py` defaults to a read-only plan, checks the expected account and active Free plan, and references an existing Express cluster. It packages Linux ARM64 dependencies, deploys a new application stack, initializes the schema privately, and publishes generated frontend configuration only with `--apply`. The new full application path has been validated without creating a duplicate live application. The existing demo's maintenance addition is managed separately through `infra/operations.yaml`.
+
+The older full-configuration SAM template uses a separate Aurora Data API path; its PowerShell script still stops on a Free plan. Neither deployment path upgrades the account plan.
 
 ## Test commands
 
@@ -88,7 +99,7 @@ On Windows:
 $env:PYTHONPATH = "$PWD\backend"
 python -m unittest discover -s tests -v
 node --check frontend/app.js
-cfn-lint infra/template.yaml
+cfn-lint infra/template.yaml infra/express.yaml infra/operations.yaml
 ```
 
 On macOS/Linux:
@@ -96,7 +107,7 @@ On macOS/Linux:
 ```sh
 PYTHONPATH=backend python3 -m unittest discover -s tests -v
 node --check frontend/app.js
-cfn-lint infra/template.yaml
+cfn-lint infra/template.yaml infra/express.yaml infra/operations.yaml
 ```
 
 Set `TEST_DATABASE_URL` only for a dedicated disposable PostgreSQL database to include the 14 database integration tests. They create and drop isolated test schemas. GitHub Actions provides PostgreSQL 17 for this suite; hosted CI results are separate from local checks.
@@ -105,7 +116,9 @@ Set `TEST_DATABASE_URL` only for a dedicated disposable PostgreSQL database to i
 
 SQLite serializes writers. PostgreSQL uses explicit transactions and row locks. Results from the local benchmark are not AWS throughput measurements.
 
-The live two-Lambda demo attempts immediate snapshot delivery. Durable outbox replay and reconciliation handlers are implemented, but scheduled worker and reconciliation functions are not enabled in that deployment. The local background worker supports the recovery demonstration.
+API mutations attempt immediate snapshot delivery and send a generic SQS signal after commit. The private worker drains up to 100 outbox events, reconciles, and requests continuation for a full batch. Notification failures preserve the committed result; a configurable daily signal recovers missed notifications. AWS recursion protection remains enabled, so exceptionally large continuation chains may stop and need an independent daily/API signal or DLQ review.
+
+Daily recovery can briefly wake auto-paused Aurora and consume Free plan credits. Queue polling, storage, logs, and requests also have usage costs. There is no minute-by-minute database polling; local mode remains available without AWS.
 
 S3 static website configuration is enabled, while the public delivery path uses CloudFront's private S3 REST origin. Cognito authenticates browser users; IAM authorizes Lambda access to AWS resources. These are distinct responsibilities.
 

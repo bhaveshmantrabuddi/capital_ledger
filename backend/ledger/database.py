@@ -24,7 +24,7 @@ class Session:
 class Database:
     def __init__(self, backend='sqlite', location='ledger.db', *, cluster_arn=None,
                  secret_arn=None, database='ledger', client=None, host=None,
-                 port=5432, username='postgres', sslrootcert=None):
+                 port=5432, username='postgres', sslrootcert=None, connect_timeout=10):
         self.backend = backend
         self.location = str(location)
         self.cluster_arn = cluster_arn
@@ -32,6 +32,9 @@ class Database:
         self.database = database
         self.client = client
         self.host, self.port, self.username = host, int(port), username
+        if isinstance(connect_timeout, bool) or not isinstance(connect_timeout, int) or not 1 <= connect_timeout <= 60:
+            raise ValueError('Connection timeout must be an integer from 1 to 60 seconds.')
+        self.connect_timeout = connect_timeout
         self.sslrootcert = sslrootcert or str(Path(__file__).with_name('aws-trust-ca.pem'))
         if backend == 'aurora_iam':
             if not host:
@@ -90,20 +93,13 @@ class Database:
                 conn = psycopg.connect(host=self.host, port=self.port,
                     user=self.username, dbname=self.database, password=token,
                     sslmode='verify-full', sslrootcert=self.sslrootcert,
-                    row_factory=dict_row, connect_timeout=10)
+                    row_factory=dict_row, connect_timeout=self.connect_timeout)
             else:
                 conn = psycopg.connect(self.location, row_factory=dict_row,
-                                       connect_timeout=10)
-            if not write:
-                conn.execute('SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY')
-            conn.execute("SET LOCAL lock_timeout = '2000ms'")
-            conn.execute("SET LOCAL statement_timeout = '8000ms'")
+                                       connect_timeout=self.connect_timeout)
         else:
             conn = sqlite3.connect(self.location, timeout=30, isolation_level=None)
             conn.row_factory = sqlite3.Row
-            conn.execute('PRAGMA foreign_keys=ON')
-            conn.execute('PRAGMA busy_timeout=30000')
-            conn.execute('BEGIN IMMEDIATE' if write else 'BEGIN')
 
         def run(sql, params):
             if self.backend in ('postgres', 'aurora_iam'):
@@ -111,6 +107,15 @@ class Database:
             cursor = conn.execute(sql, params)
             return [dict(r) for r in cursor.fetchall()] if cursor.description else []
         try:
+            if self.backend in ('postgres', 'aurora_iam'):
+                if not write:
+                    conn.execute('SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY')
+                conn.execute("SET LOCAL lock_timeout = '2000ms'")
+                conn.execute("SET LOCAL statement_timeout = '8000ms'")
+            else:
+                conn.execute('PRAGMA foreign_keys=ON')
+                conn.execute('PRAGMA busy_timeout=30000')
+                conn.execute('BEGIN IMMEDIATE' if write else 'BEGIN')
             yield Session(run, self.backend in ('postgres', 'aurora_iam'))
             conn.commit()
         except BaseException:

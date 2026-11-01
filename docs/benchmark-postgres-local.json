@@ -1,0 +1,134 @@
+{
+  "recorded_at_utc": "2026-11-01T21:28:51.998886+00:00",
+  "benchmark": "PostgreSQL ledger engine; not HTTP or AWS throughput",
+  "environment": {
+    "os": "Windows",
+    "os_release": "11",
+    "architecture": "AMD64",
+    "processor": "Intel64 Family 6 Model 126 Stepping 5, GenuineIntel",
+    "logical_cpus": 8,
+    "python": "3.13.0",
+    "postgresql": {
+      "version": "PostgreSQL 18.1 on x86_64-windows, compiled by msvc-19.44.35219, 64-bit",
+      "version_num": 180001,
+      "driver": "psycopg",
+      "driver_version": "3.3.6"
+    }
+  },
+  "configuration": {
+    "deposit_requests": 200,
+    "concurrency": 8,
+    "seed": 2026,
+    "connections": "fresh connection per engine transaction; no pool",
+    "projection": "LocalProjection on the same PostgreSQL server; delivery and reconciliation excluded from timed workloads",
+    "latency": "inside worker; excludes executor queue wait; wall throughput includes dispatch",
+    "schema": "isolated generated schema, removed after run"
+  },
+  "workloads": [
+    {
+      "requests": 200,
+      "duration_seconds": 12.722992,
+      "requests_per_second": 15.72,
+      "successful_responses_per_second": 15.72,
+      "categories": {
+        "success": 200
+      },
+      "latency_ms": {
+        "mean": 498.128,
+        "p50": 486.275,
+        "p95": 688.992,
+        "p99": 772.889,
+        "max": 880.115
+      },
+      "name": "distinct_key_deposits",
+      "amount_cents": 1,
+      "final_balance_cents": 200,
+      "committed_transactions": 200,
+      "checks": {
+        "outcomes_match": true,
+        "balance_matches": true,
+        "transaction_count_matches": true
+      },
+      "invariants": {
+        "ledger_balances_match": true,
+        "transactions_have_two_balanced_entries": true,
+        "customer_balances_nonnegative": true,
+        "projection_versions_and_balances_match": true,
+        "pending_outbox_events": 0,
+        "accounts_checked": 2
+      }
+    },
+    {
+      "requests": 32,
+      "duration_seconds": 1.229893,
+      "requests_per_second": 26.019,
+      "successful_responses_per_second": 8.131,
+      "categories": {
+        "insufficient_funds": 22,
+        "success": 10
+      },
+      "latency_ms": {
+        "mean": 278.489,
+        "p50": 207.741,
+        "p95": 535.128,
+        "p99": 586.775,
+        "max": 586.775
+      },
+      "name": "overdraft_contention",
+      "amount_cents": 1000,
+      "opening_balance_cents": 10000,
+      "final_balance_cents": 0,
+      "committed_transactions": 11,
+      "checks": {
+        "outcomes_match": true,
+        "balance_matches": true,
+        "transaction_count_matches": true
+      },
+      "invariants": {
+        "ledger_balances_match": true,
+        "transactions_have_two_balanced_entries": true,
+        "customer_balances_nonnegative": true,
+        "projection_versions_and_balances_match": true,
+        "pending_outbox_events": 0,
+        "accounts_checked": 3
+      }
+    },
+    {
+      "requests": 32,
+      "duration_seconds": 1.356016,
+      "requests_per_second": 23.599,
+      "successful_responses_per_second": 23.599,
+      "categories": {
+        "success": 32
+      },
+      "latency_ms": {
+        "mean": 300.163,
+        "p50": 287.083,
+        "p95": 369.579,
+        "p99": 390.051,
+        "max": 390.051
+      },
+      "name": "same_key_replay",
+      "amount_cents": 500,
+      "final_balance_cents": 500,
+      "committed_transactions": 1,
+      "replayed_responses": 31,
+      "checks": {
+        "outcomes_match": true,
+        "balance_matches": true,
+        "transaction_count_matches": true,
+        "one_transaction_for_replays": true
+      },
+      "invariants": {
+        "ledger_balances_match": true,
+        "transactions_have_two_balanced_entries": true,
+        "customer_balances_nonnegative": true,
+        "projection_versions_and_balances_match": true,
+        "pending_outbox_events": 0,
+        "accounts_checked": 4
+      }
+    }
+  ],
+  "all_checks_passed": true,
+  "schema_cleanup": "completed"
+}

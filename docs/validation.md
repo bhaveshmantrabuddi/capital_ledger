@@ -1,5 +1,19 @@
 # Validation evidence
 
+## Recovery, PostgreSQL benchmark, and Express automation - November 1, 2026
+
+The final combined local run passed **96 tests in 79.295 seconds**, including all 14 real PostgreSQL integration tests, with no skips. Two additional deployment guard/apply-contract tests were then added; the final Express module passed all **18 tests**. All three CloudFormation templates passed cfn-lint, and frontend JavaScript syntax checks passed. GitHub Actions runs the complete updated suite against PostgreSQL 17.
+
+The reproducible [PostgreSQL benchmark](benchmark-postgres.md) ran against an isolated PostgreSQL 18.1 instance on Windows: 200 distinct-key deposits with 8 workers completed at **15.72 responses/s**, p50 **486.275 ms**, p95 **688.992 ms**, and p99 **772.889 ms**. Contending withdrawals produced 10 commits and 22 expected insufficient-funds rejections. Thirty-two simultaneous same-key requests returned one transaction ID and committed one financial transaction. SQL balances, double-entry records, projection versions, and outbox cleanup checks passed. These are local engine measurements with delivery outside the timed workload, not HTTP or AWS throughput. Raw reports are linked from the benchmark document.
+
+The additive `infra/operations.yaml` stack reached `CREATE_COMPLETE` in the existing AWS demo. Both HTTP Lambdas now use the updated Linux ARM64 Python 3.12 bundle, their existing configuration plus `OUTBOX_QUEUE_URL`, and scoped queue-send permission. The deployed support stack includes encrypted SQS/DLQ queues, private maintenance Lambda, maximum event-source concurrency 2, and an enabled once-daily backstop. AWS recursion protection remains `Terminate`. The account was verified as `FREE` and `ACTIVE` before and after deployment; no plan upgrade occurred. Aurora still has MinCapacity 0 and a 300-second auto-pause setting. Usage, including daily wake-ups, consumes credits.
+
+A fresh private fictional fixture committed a $100 opening balance and $25 deposit to Aurora while its initial snapshot delivery was deliberately withheld. Two durable outbox events existed and DynamoDB had no fixture snapshot. A generic SQS notification caused the actual event-source mapping to invoke maintenance and deliver both events. DynamoDB reached **12500 cents, version 2**; SQL had zero remaining fixture events. A duplicate signal preserved that balance/version and the two committed transactions. Reconciliation reported **zero financial mismatches, zero projection lag, and zero global pending events**. Three count-only maintenance reports were observed without runtime errors. An internal customer-Lambda fixture also returned 201 and caused automatic maintenance notification. Public health remained 200; unauthenticated account access remained 401. See the [sanitized recovery report](recovery-aws.json).
+
+This test deliberately delayed delivery; it did not induce a DynamoDB outage. The internal Lambda fixture does not replace the prior browser/Cognito verification. Daily rule configuration was verified without waiting a full day. Live DLQ retry timing and large continuation-chain limits were not exercised; handler tests cover failures and retries.
+
+The new `infra/express.yaml` and guarded `scripts/deploy-express.py` passed real read-only AWS identity, Free plan, database, ownership, and CloudFormation validation checks. An actual Linux ARM64 CPython 3.12 dependency archive was built and verified. The complete new application stack was **not deployed from scratch**; the live deployment above added only maintenance to the existing application. Full provisioning and frontend/bootstrap sequencing are covered by local contract tests, with a fresh end-to-end deployment still required before claiming that path is live-tested.
+
 ## Publication checks - November 1, 2026
 
 The publication export ran **59 tests in 12.958 seconds**: **45 passed and 14 PostgreSQL integration tests were skipped** because no dedicated disposable PostgreSQL instance was configured for this run. The AWS boundary module includes 15 tests, including the regression for a null optional JWT scopes field. Frontend JavaScript and local configuration syntax checks passed.
@@ -8,7 +22,7 @@ The publication export ran **59 tests in 12.958 seconds**: **45 passed and 14 Po
 
 Verified the deployed S3/CloudFront website, Cognito sign-in, API Gateway JWT and required scope configuration, separate customer/transaction Lambda handlers, IAM execution permissions, Aurora Express IAM/TLS connection, and DynamoDB customer records. A fictional account was created with $100, received a $25 deposit, and completed a $10 withdrawal. Its $115 balance persisted after a page reload; a $200 withdrawal was rejected without changing the balance. A read-only Aurora query returned the three successful transactions, and DynamoDB held 11500 cents at version 3 for that same account. A repeated earlier withdrawal test returned the original transaction ID and unchanged balance/version, verifying a live idempotent replay.
 
-The narrated demonstration includes actual AWS console configuration views and relevant code. Recordings and account-specific raw evidence are kept outside the source repository. These checks establish the demonstrated workflow, not AWS load capacity, a live service-outage recovery test, or deployed scheduled workers. The live setup has two HTTP Lambdas and post-commit projection attempts; scheduled outbox processing and reconciliation remain optional.
+The narrated demonstration includes actual AWS console configuration views and relevant code. Recordings and account-specific raw evidence are kept outside the source repository. These historical checks establish the demonstrated workflow, not AWS load capacity or a live service-outage recovery test. At that checkpoint the live setup had two HTTP Lambdas and post-commit projection attempts. The November 1 recovery extension above supersedes its earlier pending maintenance status.
 
 ## Aurora Express setup - October 30, 2026
 
@@ -101,4 +115,4 @@ For a deployed API, set a current access token in `LEDGER_BENCH_TOKEN` and suppl
 
 ## Evidence boundaries
 
-The historical tests and benchmark above describe their actual environments and dates. The October 31 section records the deployed AWS workflow, while the November 1 section records the publication test run. The optional SAM path and scheduled worker deployment are not represented as live-tested resources.
+The historical tests and benchmarks above describe their actual environments and dates. The October 31 section records the deployed browser workflow; the latest November 1 section records live SQS recovery, real PostgreSQL measurements, and automation validation. The older full-configuration SAM path and a fresh complete Express application-stack deployment are not represented as live-tested provisioning paths.

@@ -1,0 +1,516 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Capital Ledger HTTPS application using an existing IAM-enabled Aurora Express cluster. Does not create or adopt a database.
+
+Parameters:
+  ResourcePrefix:
+    Type: String
+    Default: capital-ledger-express
+    AllowedPattern: '^[a-z][a-z0-9-]{2,31}$'
+  AuroraHost:
+    Type: String
+    AllowedPattern: '^[A-Za-z0-9.-]+$'
+  AuroraClusterResourceId:
+    Type: String
+    AllowedPattern: '^cluster-[A-Za-z0-9]+$'
+  AuroraUsername:
+    Type: String
+    Default: postgres
+    AllowedPattern: '^[A-Za-z_][A-Za-z0-9_]*$'
+  AuroraDatabase:
+    Type: String
+    Default: postgres
+    AllowedPattern: '^[A-Za-z_][A-Za-z0-9_]*$'
+  LambdaArtifactBucket:
+    Type: String
+  LambdaArtifactKey:
+    Type: String
+  OperationsTemplateUrl:
+    Type: String
+    AllowedPattern: '^https://[a-z0-9.-]+\.s3\.[a-z0-9-]+\.amazonaws\.com/.+$'
+  CognitoDomainPrefix:
+    Type: String
+    AllowedPattern: '^[a-z0-9][a-z0-9-]{2,62}$'
+  DevelopmentOrigin:
+    Type: String
+    Default: ''
+    AllowedPattern: '^$|^http://(localhost|127\.0\.0\.1):[0-9]{2,5}$'
+    Description: Optional exact local development origin, without a trailing slash.
+  EnableDailyRecovery:
+    Type: String
+    Default: 'true'
+    AllowedValues: ['true', 'false']
+    Description: Daily recovery can briefly wake idle Aurora and consume Free plan credits.
+
+Conditions:
+  HasDevelopmentOrigin: !Not [!Equals [!Ref DevelopmentOrigin, '']]
+
+Resources:
+  AccountsTable:
+    Type: AWS::DynamoDB::Table
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      TableName: !Sub '${ResourcePrefix}-customers'
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: account_id
+          AttributeType: S
+      KeySchema:
+        - AttributeName: account_id
+          KeyType: HASH
+
+  Operations:
+    Type: AWS::CloudFormation::Stack
+    Properties:
+      TemplateURL: !Ref OperationsTemplateUrl
+      Parameters:
+        ResourcePrefix: !Ref ResourcePrefix
+        AuroraHost: !Ref AuroraHost
+        AuroraClusterResourceId: !Ref AuroraClusterResourceId
+        AuroraUsername: !Ref AuroraUsername
+        AuroraDatabase: !Ref AuroraDatabase
+        AccountsTableName: !Ref AccountsTable
+        LambdaArtifactBucket: !Ref LambdaArtifactBucket
+        LambdaArtifactKey: !Ref LambdaArtifactKey
+        EnableDailyRecovery: !Ref EnableDailyRecovery
+
+  FrontendBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      WebsiteConfiguration:
+        IndexDocument: index.html
+        ErrorDocument: index.html
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        IgnorePublicAcls: true
+        BlockPublicPolicy: true
+        RestrictPublicBuckets: true
+      OwnershipControls:
+        Rules:
+          - ObjectOwnership: BucketOwnerEnforced
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+  OriginAccessControl:
+    Type: AWS::CloudFront::OriginAccessControl
+    Properties:
+      OriginAccessControlConfig:
+        Name: !Sub '${ResourcePrefix}-frontend'
+        OriginAccessControlOriginType: s3
+        SigningBehavior: always
+        SigningProtocol: sigv4
+  Distribution:
+    Type: AWS::CloudFront::Distribution
+    Properties:
+      DistributionConfig:
+        Enabled: true
+        Comment: Capital Ledger private S3 frontend
+        DefaultRootObject: index.html
+        HttpVersion: http2
+        PriceClass: PriceClass_100
+        Origins:
+          - Id: frontend-s3
+            DomainName: !GetAtt FrontendBucket.RegionalDomainName
+            OriginAccessControlId: !Ref OriginAccessControl
+            S3OriginConfig:
+              OriginAccessIdentity: ''
+        DefaultCacheBehavior:
+          TargetOriginId: frontend-s3
+          ViewerProtocolPolicy: redirect-to-https
+          AllowedMethods: [GET, HEAD, OPTIONS]
+          CachedMethods: [GET, HEAD]
+          Compress: true
+          CachePolicyId: 413f160f-195e-4e8d-a15f-70a343da33b0
+        ViewerCertificate:
+          CloudFrontDefaultCertificate: true
+  FrontendBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref FrontendBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: cloudfront.amazonaws.com
+            Action: s3:GetObject
+            Resource: !Sub '${FrontendBucket.Arn}/*'
+            Condition:
+              StringEquals:
+                AWS:SourceArn: !Sub 'arn:${AWS::Partition}:cloudfront::${AWS::AccountId}:distribution/${Distribution}'
+
+  UserPool:
+    Type: AWS::Cognito::UserPool
+    Properties:
+      UserPoolName: !Sub '${ResourcePrefix}-users'
+      UsernameAttributes: [email]
+      AutoVerifiedAttributes: [email]
+      UsernameConfiguration:
+        CaseSensitive: false
+      Policies:
+        PasswordPolicy:
+          MinimumLength: 12
+          RequireLowercase: true
+          RequireUppercase: true
+          RequireNumbers: true
+          RequireSymbols: true
+      Schema:
+        - Name: email
+          AttributeDataType: String
+          Required: true
+          Mutable: true
+  ResourceServer:
+    Type: AWS::Cognito::UserPoolResourceServer
+    Properties:
+      UserPoolId: !Ref UserPool
+      Identifier: ledger-api
+      Name: Capital Ledger API
+      Scopes:
+        - ScopeName: access
+          ScopeDescription: Access the signed-in user's simulated accounts
+  UserPoolClient:
+    Type: AWS::Cognito::UserPoolClient
+    DependsOn: ResourceServer
+    Properties:
+      UserPoolId: !Ref UserPool
+      ClientName: !Sub '${ResourcePrefix}-web'
+      GenerateSecret: false
+      PreventUserExistenceErrors: ENABLED
+      AllowedOAuthFlowsUserPoolClient: true
+      AllowedOAuthFlows: [code]
+      AllowedOAuthScopes: [openid, email, ledger-api/access]
+      SupportedIdentityProviders: [COGNITO]
+      CallbackURLs:
+        - !Sub 'https://${Distribution.DomainName}/'
+        - !If [HasDevelopmentOrigin, !Sub '${DevelopmentOrigin}/', !Ref 'AWS::NoValue']
+      LogoutURLs:
+        - !Sub 'https://${Distribution.DomainName}/'
+        - !If [HasDevelopmentOrigin, !Sub '${DevelopmentOrigin}/', !Ref 'AWS::NoValue']
+      DefaultRedirectURI: !Sub 'https://${Distribution.DomainName}/'
+      AccessTokenValidity: 60
+      IdTokenValidity: 60
+      RefreshTokenValidity: 1
+      TokenValidityUnits:
+        AccessToken: minutes
+        IdToken: minutes
+        RefreshToken: days
+      EnableTokenRevocation: true
+  UserPoolDomain:
+    Type: AWS::Cognito::UserPoolDomain
+    Properties:
+      UserPoolId: !Ref UserPool
+      Domain: !Ref CognitoDomainPrefix
+
+  CustomersLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${ResourcePrefix}-customers'
+      RetentionInDays: 14
+  TransactionsLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${ResourcePrefix}-transactions'
+      RetentionInDays: 14
+  BootstrapLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${ResourcePrefix}-bootstrap'
+      RetentionInDays: 14
+  ApplicationRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: LedgerApplication
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: ConnectExistingExpressDatabase
+                Effect: Allow
+                Action: rds-db:connect
+                Resource: !Sub 'arn:${AWS::Partition}:rds-db:${AWS::Region}:${AWS::AccountId}:dbuser:${AuroraClusterResourceId}/${AuroraUsername}'
+              - Sid: CustomerSnapshots
+                Effect: Allow
+                Action: [dynamodb:GetItem, dynamodb:PutItem]
+                Resource: !GetAtt AccountsTable.Arn
+              - Sid: NotifyRecovery
+                Effect: Allow
+                Action: sqs:SendMessage
+                Resource: !GetAtt Operations.Outputs.OutboxQueueArn
+              - Sid: WriteApplicationLogs
+                Effect: Allow
+                Action: [logs:CreateLogStream, logs:PutLogEvents]
+                Resource:
+                  - !Sub '${CustomersLogGroup.Arn}'
+                  - !Sub '${TransactionsLogGroup.Arn}'
+  BootstrapRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: BootstrapExistingExpressDatabase
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: rds-db:connect
+                Resource: !Sub 'arn:${AWS::Partition}:rds-db:${AWS::Region}:${AWS::AccountId}:dbuser:${AuroraClusterResourceId}/${AuroraUsername}'
+              - Effect: Allow
+                Action: [logs:CreateLogStream, logs:PutLogEvents]
+                Resource: !GetAtt BootstrapLogGroup.Arn
+  CustomersFunction:
+    Type: AWS::Lambda::Function
+    DependsOn: CustomersLogGroup
+    Properties:
+      FunctionName: !Sub '${ResourcePrefix}-customers'
+      Runtime: python3.12
+      Architectures: [arm64]
+      Handler: ledger.handlers.accounts_handler
+      MemorySize: 256
+      Timeout: 30
+      Role: !GetAtt ApplicationRole.Arn
+      Code:
+        S3Bucket: !Ref LambdaArtifactBucket
+        S3Key: !Ref LambdaArtifactKey
+      Environment:
+        Variables:
+          DB_BACKEND: aurora_iam
+          AUTH_MODE: cognito
+          AURORA_HOST: !Ref AuroraHost
+          AURORA_PORT: '5432'
+          AURORA_USERNAME: !Ref AuroraUsername
+          AURORA_DATABASE: !Ref AuroraDatabase
+          AURORA_CONNECT_TIMEOUT: '10'
+          ACCOUNTS_TABLE: !Ref AccountsTable
+          OUTBOX_QUEUE_URL: !GetAtt Operations.Outputs.OutboxQueueUrl
+  TransactionsFunction:
+    Type: AWS::Lambda::Function
+    DependsOn: TransactionsLogGroup
+    Properties:
+      FunctionName: !Sub '${ResourcePrefix}-transactions'
+      Runtime: python3.12
+      Architectures: [arm64]
+      Handler: ledger.handlers.transactions_handler
+      MemorySize: 256
+      Timeout: 45
+      Role: !GetAtt ApplicationRole.Arn
+      Code:
+        S3Bucket: !Ref LambdaArtifactBucket
+        S3Key: !Ref LambdaArtifactKey
+      Environment:
+        Variables:
+          DB_BACKEND: aurora_iam
+          AUTH_MODE: cognito
+          AURORA_HOST: !Ref AuroraHost
+          AURORA_PORT: '5432'
+          AURORA_USERNAME: !Ref AuroraUsername
+          AURORA_DATABASE: !Ref AuroraDatabase
+          AURORA_CONNECT_TIMEOUT: '10'
+          ACCOUNTS_TABLE: !Ref AccountsTable
+          OUTBOX_QUEUE_URL: !GetAtt Operations.Outputs.OutboxQueueUrl
+  BootstrapFunction:
+    Type: AWS::Lambda::Function
+    DependsOn: BootstrapLogGroup
+    Properties:
+      FunctionName: !Sub '${ResourcePrefix}-bootstrap'
+      Runtime: python3.12
+      Architectures: [arm64]
+      Handler: ledger.handlers.bootstrap_handler
+      MemorySize: 256
+      Timeout: 120
+      Role: !GetAtt BootstrapRole.Arn
+      Code:
+        S3Bucket: !Ref LambdaArtifactBucket
+        S3Key: !Ref LambdaArtifactKey
+      Environment:
+        Variables:
+          DB_BACKEND: aurora_iam
+          AUTH_MODE: cognito
+          AURORA_HOST: !Ref AuroraHost
+          AURORA_PORT: '5432'
+          AURORA_USERNAME: !Ref AuroraUsername
+          AURORA_DATABASE: !Ref AuroraDatabase
+          AURORA_CONNECT_TIMEOUT: '30'
+          ACCOUNTS_TABLE: !Ref AccountsTable
+
+  HttpApi:
+    Type: AWS::ApiGatewayV2::Api
+    Properties:
+      Name: !Sub '${ResourcePrefix}-api'
+      ProtocolType: HTTP
+      CorsConfiguration:
+        AllowOrigins:
+          - !Sub 'https://${Distribution.DomainName}'
+          - !If [HasDevelopmentOrigin, !Ref DevelopmentOrigin, !Ref 'AWS::NoValue']
+        AllowMethods: [GET, POST, OPTIONS]
+        AllowHeaders: [authorization, content-type, idempotency-key]
+        MaxAge: 300
+  JwtAuthorizer:
+    Type: AWS::ApiGatewayV2::Authorizer
+    Properties:
+      ApiId: !Ref HttpApi
+      Name: CognitoAccessToken
+      AuthorizerType: JWT
+      IdentitySource: ['$request.header.Authorization']
+      JwtConfiguration:
+        Audience: [!Ref UserPoolClient]
+        Issuer: !Sub 'https://cognito-idp.${AWS::Region}.${AWS::URLSuffix}/${UserPool}'
+  CustomersIntegration:
+    Type: AWS::ApiGatewayV2::Integration
+    Properties:
+      ApiId: !Ref HttpApi
+      IntegrationType: AWS_PROXY
+      IntegrationUri: !GetAtt CustomersFunction.Arn
+      PayloadFormatVersion: '2.0'
+      TimeoutInMillis: 30000
+  TransactionsIntegration:
+    Type: AWS::ApiGatewayV2::Integration
+    Properties:
+      ApiId: !Ref HttpApi
+      IntegrationType: AWS_PROXY
+      IntegrationUri: !GetAtt TransactionsFunction.Arn
+      PayloadFormatVersion: '2.0'
+      TimeoutInMillis: 30000
+  CustomersPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref CustomersFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub 'arn:${AWS::Partition}:execute-api:${AWS::Region}:${AWS::AccountId}:${HttpApi}/*/*/api/*'
+  TransactionsPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref TransactionsFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub 'arn:${AWS::Partition}:execute-api:${AWS::Region}:${AWS::AccountId}:${HttpApi}/*/*/api/*'
+  HealthRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref HttpApi
+      RouteKey: GET /api/health
+      AuthorizationType: NONE
+      Target: !Sub 'integrations/${CustomersIntegration}'
+  MeRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref HttpApi
+      RouteKey: GET /api/me
+      AuthorizationType: JWT
+      AuthorizerId: !Ref JwtAuthorizer
+      AuthorizationScopes: [ledger-api/access]
+      Target: !Sub 'integrations/${CustomersIntegration}'
+  ListAccountsRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref HttpApi
+      RouteKey: GET /api/accounts
+      AuthorizationType: JWT
+      AuthorizerId: !Ref JwtAuthorizer
+      AuthorizationScopes: [ledger-api/access]
+      Target: !Sub 'integrations/${CustomersIntegration}'
+  CreateAccountRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref HttpApi
+      RouteKey: POST /api/accounts
+      AuthorizationType: JWT
+      AuthorizerId: !Ref JwtAuthorizer
+      AuthorizationScopes: [ledger-api/access]
+      Target: !Sub 'integrations/${CustomersIntegration}'
+  GetAccountRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref HttpApi
+      RouteKey: 'GET /api/accounts/{id}'
+      AuthorizationType: JWT
+      AuthorizerId: !Ref JwtAuthorizer
+      AuthorizationScopes: [ledger-api/access]
+      Target: !Sub 'integrations/${CustomersIntegration}'
+  DepositRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref HttpApi
+      RouteKey: 'POST /api/accounts/{id}/deposits'
+      AuthorizationType: JWT
+      AuthorizerId: !Ref JwtAuthorizer
+      AuthorizationScopes: [ledger-api/access]
+      Target: !Sub 'integrations/${TransactionsIntegration}'
+  WithdrawalRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref HttpApi
+      RouteKey: 'POST /api/accounts/{id}/withdrawals'
+      AuthorizationType: JWT
+      AuthorizerId: !Ref JwtAuthorizer
+      AuthorizationScopes: [ledger-api/access]
+      Target: !Sub 'integrations/${TransactionsIntegration}'
+  TransferRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref HttpApi
+      RouteKey: POST /api/transfers
+      AuthorizationType: JWT
+      AuthorizerId: !Ref JwtAuthorizer
+      AuthorizationScopes: [ledger-api/access]
+      Target: !Sub 'integrations/${TransactionsIntegration}'
+  TransactionsRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref HttpApi
+      RouteKey: GET /api/transactions
+      AuthorizationType: JWT
+      AuthorizerId: !Ref JwtAuthorizer
+      AuthorizationScopes: [ledger-api/access]
+      Target: !Sub 'integrations/${TransactionsIntegration}'
+  DefaultStage:
+    Type: AWS::ApiGatewayV2::Stage
+    Properties:
+      ApiId: !Ref HttpApi
+      StageName: '$default'
+      AutoDeploy: true
+      DefaultRouteSettings:
+        ThrottlingBurstLimit: 20
+        ThrottlingRateLimit: 10
+
+Outputs:
+  WebsiteUrl:
+    Value: !Sub 'https://${Distribution.DomainName}/'
+  ApiBaseUrl:
+    Value: !GetAtt HttpApi.ApiEndpoint
+  FrontendBucketName:
+    Value: !Ref FrontendBucket
+  DistributionId:
+    Value: !Ref Distribution
+  CognitoDomain:
+    Value: !Sub 'https://${CognitoDomainPrefix}.auth.${AWS::Region}.amazoncognito.com'
+  CognitoClientId:
+    Value: !Ref UserPoolClient
+  AccountsTableName:
+    Value: !Ref AccountsTable
+  CustomersFunctionName:
+    Value: !Ref CustomersFunction
+  TransactionsFunctionName:
+    Value: !Ref TransactionsFunction
+  BootstrapFunctionName:
+    Value: !Ref BootstrapFunction
+  OutboxQueueUrl:
+    Value: !GetAtt Operations.Outputs.OutboxQueueUrl
+  MaintenanceFunctionName:
+    Value: !GetAtt Operations.Outputs.MaintenanceFunctionName

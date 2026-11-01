@@ -1,0 +1,174 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Capital Ledger event-driven outbox recovery and private reconciliation for an existing Aurora Express deployment.
+
+Parameters:
+  ResourcePrefix:
+    Type: String
+    Default: capital-ledger
+    AllowedPattern: '^[a-z][a-z0-9-]{2,39}$'
+  AuroraHost:
+    Type: String
+    AllowedPattern: '^[A-Za-z0-9.-]+$'
+  AuroraClusterResourceId:
+    Type: String
+    AllowedPattern: '^cluster-[A-Za-z0-9]+$'
+    Description: Aurora cluster resource ID, not its friendly identifier or ARN.
+  AuroraUsername:
+    Type: String
+    Default: postgres
+    AllowedPattern: '^[A-Za-z_][A-Za-z0-9_]*$'
+  AuroraDatabase:
+    Type: String
+    Default: postgres
+    AllowedPattern: '^[A-Za-z_][A-Za-z0-9_]*$'
+  AccountsTableName:
+    Type: String
+    AllowedPattern: '^[A-Za-z0-9_.-]{3,255}$'
+  LambdaArtifactBucket:
+    Type: String
+  LambdaArtifactKey:
+    Type: String
+  EnableDailyRecovery:
+    Type: String
+    Default: 'true'
+    AllowedValues: ['true', 'false']
+    Description: Once-daily safety net for a lost commit notification. It can briefly wake idle Aurora and consume credits.
+
+Conditions:
+  DailyRecoveryEnabled: !Equals [!Ref EnableDailyRecovery, 'true']
+
+Resources:
+  DeadLetterQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub '${ResourcePrefix}-outbox-dead-letter'
+      MessageRetentionPeriod: 1209600
+      SqsManagedSseEnabled: true
+  OutboxQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub '${ResourcePrefix}-outbox'
+      MessageRetentionPeriod: 345600
+      VisibilityTimeout: 900
+      SqsManagedSseEnabled: true
+      RedrivePolicy:
+        deadLetterTargetArn: !GetAtt DeadLetterQueue.Arn
+        maxReceiveCount: 4
+  MaintenanceLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${ResourcePrefix}-maintenance'
+      RetentionInDays: 14
+  MaintenanceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ResourcePrefix}-maintenance-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: ProjectMaintenance
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: ConnectExpressDatabase
+                Effect: Allow
+                Action: rds-db:connect
+                Resource: !Sub 'arn:${AWS::Partition}:rds-db:${AWS::Region}:${AWS::AccountId}:dbuser:${AuroraClusterResourceId}/${AuroraUsername}'
+              - Sid: CustomerSnapshots
+                Effect: Allow
+                Action: [dynamodb:GetItem, dynamodb:PutItem]
+                Resource: !Sub 'arn:${AWS::Partition}:dynamodb:${AWS::Region}:${AWS::AccountId}:table/${AccountsTableName}'
+              - Sid: ProcessAndContinueOutbox
+                Effect: Allow
+                Action: [sqs:ReceiveMessage, sqs:DeleteMessage, sqs:GetQueueAttributes, sqs:SendMessage]
+                Resource: !GetAtt OutboxQueue.Arn
+              - Sid: WriteMaintenanceLogs
+                Effect: Allow
+                Action: [logs:CreateLogStream, logs:PutLogEvents]
+                Resource: !Sub 'arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/${ResourcePrefix}-maintenance:*'
+  MaintenanceFunction:
+    Type: AWS::Lambda::Function
+    DependsOn: MaintenanceLogGroup
+    Properties:
+      FunctionName: !Sub '${ResourcePrefix}-maintenance'
+      Description: Private SQS-triggered outbox replay and count-only reconciliation reports.
+      Runtime: python3.12
+      Architectures: [arm64]
+      Handler: ledger.handlers.maintenance_handler
+      # Keep default AWS recursion safeguards. Very large continuation chains can
+      # need an independent API/daily notification or DLQ review to resume.
+      Timeout: 120
+      MemorySize: 256
+      Role: !GetAtt MaintenanceRole.Arn
+      Code:
+        S3Bucket: !Ref LambdaArtifactBucket
+        S3Key: !Ref LambdaArtifactKey
+      Environment:
+        Variables:
+          DB_BACKEND: aurora_iam
+          AUTH_MODE: cognito
+          AURORA_HOST: !Ref AuroraHost
+          AURORA_PORT: '5432'
+          AURORA_USERNAME: !Ref AuroraUsername
+          AURORA_DATABASE: !Ref AuroraDatabase
+          AURORA_CONNECT_TIMEOUT: '30'
+          ACCOUNTS_TABLE: !Ref AccountsTableName
+          OUTBOX_QUEUE_URL: !Ref OutboxQueue
+  OutboxMapping:
+    Type: AWS::Lambda::EventSourceMapping
+    Properties:
+      EventSourceArn: !GetAtt OutboxQueue.Arn
+      FunctionName: !Ref MaintenanceFunction
+      BatchSize: 10
+      MaximumBatchingWindowInSeconds: 0
+      Enabled: true
+      ScalingConfig:
+        MaximumConcurrency: 2
+  DailyRecoveryRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub '${ResourcePrefix}-daily-recovery'
+      Description: Daily outbox/reconciliation backstop; no minute-by-minute database polling.
+      ScheduleExpression: rate(1 day)
+      State: !If [DailyRecoveryEnabled, ENABLED, DISABLED]
+      Targets:
+        - Id: OutboxWakeup
+          Arn: !GetAtt OutboxQueue.Arn
+          Input: '{"version":1,"reason":"daily_recovery"}'
+  DailyRecoveryQueuePolicy:
+    Type: AWS::SQS::QueuePolicy
+    Properties:
+      Queues: [!Ref OutboxQueue]
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: OnlyDailyRecoveryRule
+            Effect: Allow
+            Principal:
+              Service: events.amazonaws.com
+            Action: sqs:SendMessage
+            Resource: !GetAtt OutboxQueue.Arn
+            Condition:
+              ArnEquals:
+                aws:SourceArn: !GetAtt DailyRecoveryRule.Arn
+              StringEquals:
+                aws:SourceAccount: !Ref AWS::AccountId
+
+Outputs:
+  OutboxQueueUrl:
+    Value: !Ref OutboxQueue
+  OutboxQueueArn:
+    Value: !GetAtt OutboxQueue.Arn
+  MaintenanceFunctionName:
+    Value: !Ref MaintenanceFunction
+  MaintenanceFunctionArn:
+    Value: !GetAtt MaintenanceFunction.Arn
+  DeadLetterQueueName:
+    Value: !GetAtt DeadLetterQueue.QueueName
+  DeadLetterQueueUrl:
+    Value: !Ref DeadLetterQueue

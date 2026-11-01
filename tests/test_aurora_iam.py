@@ -56,6 +56,33 @@ class AuroraIAMTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, 'endpoint'):
             Database('aurora_iam', client=Mock())
 
+    def test_resume_timeout_is_configurable_and_tls_is_preserved(self):
+        db = Database('aurora_iam', host='sample.cluster.test.rds.amazonaws.com',
+                      client=Mock(), connect_timeout=30)
+        conn = Mock()
+        with patch('psycopg.connect', return_value=conn) as connect:
+            with db.transaction(False):
+                pass
+        self.assertEqual(connect.call_args.kwargs['connect_timeout'], 30)
+        self.assertEqual(connect.call_args.kwargs['sslmode'], 'verify-full')
+        conn.close.assert_called_once()
+
+    def test_transaction_setup_failure_also_closes_the_connection(self):
+        db, _ = self.make_database()
+        conn = Mock()
+        conn.execute.side_effect = RuntimeError('setup failed')
+        with patch('psycopg.connect', return_value=conn):
+            with self.assertRaisesRegex(RuntimeError, 'setup failed'):
+                with db.transaction(False):
+                    self.fail('A failed setup must not enter the transaction body')
+        conn.rollback.assert_called_once()
+        conn.close.assert_called_once()
+
+    def test_connection_timeout_is_bounded(self):
+        for value in (0, 61, True, 1.5, '30'):
+            with self.subTest(value=value), self.assertRaisesRegex(ValueError, 'timeout'):
+                Database(connect_timeout=value)
+
 
 class IAMHandlerConfigurationTests(unittest.TestCase):
     def test_iam_mode_requires_no_managed_master_password(self):
@@ -70,7 +97,7 @@ class IAMHandlerConfigurationTests(unittest.TestCase):
                 handlers.service()
                 database.assert_called_once_with('aurora_iam',
                     host='sample.cluster.test.rds.amazonaws.com',port=5432,
-                    username='postgres',database='postgres')
+                    username='postgres',database='postgres',connect_timeout=10)
         finally:
             handlers.service.cache_clear()
 

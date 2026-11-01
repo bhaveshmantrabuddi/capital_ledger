@@ -1,0 +1,31 @@
+{
+  "verified_on": "2026-11-01",
+  "environment": "AWS Aurora PostgreSQL Express 17.9 / Python 3.12 ARM64 Lambda",
+  "fixture": "Fresh private fictional owner; no existing customer account was used for test transactions",
+  "public_health_status": 200,
+  "unauthenticated_accounts_status": 401,
+  "deliberately_withheld_snapshot_events": 2,
+  "recovered_pending_events": 0,
+  "expected_and_observed_balance_cents": 12500,
+  "expected_and_observed_version": 2,
+  "financial_transactions_after_duplicate_signal": 2,
+  "reconciliation_ok": true,
+  "mismatch_count": 0,
+  "projection_lag_count": 0,
+  "global_pending_events": 0,
+  "sqs_trigger_enabled": true,
+  "worker_max_concurrency": 2,
+  "daily_recovery_enabled": true,
+  "recursion_protection": "Terminate",
+  "maintenance_reports_observed": 3,
+  "internal_api_fixture_status": 201,
+  "account_plan_verified_before_and_after": "FREE ACTIVE",
+  "limits": [
+    "Initial delivery was deliberately withheld; no DynamoDB outage was induced",
+    "Recovery used SQS and actual event-source execution, rather than manual maintenance invocation",
+    "Internal Lambda fixture does not replace browser JWT sign-in validation",
+    "Daily schedule configuration verified without waiting a full day",
+    "DLQ timing and large recursion-chain limits were not exercised live",
+    "The full new Express application stack was validated but not provisioned from scratch"
+  ]
+}
